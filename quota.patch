@@ -1,0 +1,539 @@
+diff -Naur ./original/include/cobalt/kernel/sched-quota.h ./modified/include/cobalt/kernel/sched-quota.h
+--- ./original/include/cobalt/kernel/sched-quota.h	2021-03-01 17:50:32.000000000 +0100
++++ ./modified/include/cobalt/kernel/sched-quota.h	2021-05-17 19:09:58.666859400 +0200
+@@ -35,6 +35,11 @@
+ #define XNSCHED_QUOTA_NR_PRIO	\
+ 	(XNSCHED_QUOTA_MAX_PRIO - XNSCHED_QUOTA_MIN_PRIO + 1)
+ 
++#define XNSCHED_QUOTA_MIN_PRIO_GROUP 1U
++#define XNSCHED_QUOTA_MAX_PRIO_GROUP 255U
++#define XNSCHED_QUOTA_NR_PRIO_GROUP	\
++	(XNSCHED_QUOTA_MAX_PRIO_GROUP - XNSCHED_QUOTA_MIN_PRIO_GROUP + 1)
++
+ extern struct xnsched_class xnsched_class_quota;
+ 
+ struct xnsched_quota_group {
+@@ -44,10 +49,14 @@
+ 	xnticks_t run_start_ns;
+ 	xnticks_t run_budget_ns;
+ 	xnticks_t run_credit_ns;
++	struct list_head rlink;
+ 	struct list_head members;
+-	struct list_head expired;
++	struct list_head quota_expired;
++	xnsched_queue_t runnable;
+ 	struct list_head next;
+ 	int nr_active;
++	bool enqueued;
++	unsigned short int cprio;
+ 	int nr_threads;
+ 	int tgid;
+ 	int quota_percent;
+@@ -59,13 +68,13 @@
+ 	struct xntimer refill_timer;
+ 	struct xntimer limit_timer;
+ 	struct list_head groups;
++	struct list_head runnable;
++	struct list_head expired;
+ };
+ 
+ static inline int xnsched_quota_init_thread(struct xnthread *thread)
+ {
+ 	thread->quota = NULL;
+-	INIT_LIST_HEAD(&thread->quota_expired);
+-
+ 	return 0;
+ }
+ 
+@@ -81,6 +90,10 @@
+ 			     int quota_percent, int quota_peak_percent,
+ 			     int *quota_sum_r);
+ 
++
++void xnsched_quota_set_prio(struct xnsched_quota_group *tg,
++			     unsigned short int prio);
++				 
+ struct xnsched_quota_group *
+ xnsched_quota_find_group(struct xnsched *sched, int tgid);
+ 
+diff -Naur ./original/include/cobalt/kernel/thread.h ./modified/include/cobalt/kernel/thread.h
+--- ./original/include/cobalt/kernel/thread.h	2021-03-01 17:50:32.000000000 +0100
++++ ./modified/include/cobalt/kernel/thread.h	2021-05-12 17:08:38.226559900 +0200
+@@ -105,7 +105,6 @@
+ #endif
+ #ifdef CONFIG_XENO_OPT_SCHED_QUOTA
+ 	struct xnsched_quota_group *quota; /* Quota scheduling group. */
+-	struct list_head quota_expired;
+ 	struct list_head quota_next;
+ #endif
+ 	cpumask_t affinity;	/* Processor affinity. */
+diff -Naur ./original/include/cobalt/uapi/sched.h ./modified/include/cobalt/uapi/sched.h
+--- ./original/include/cobalt/uapi/sched.h	2021-03-01 17:50:32.000000000 +0100
++++ ./modified/include/cobalt/uapi/sched.h	2021-05-17 19:14:12.161082900 +0200
+@@ -103,6 +103,7 @@
+ 			int tgid;
+ 			int quota;
+ 			int quota_peak;
++			unsigned short int prio;
+ 		} set;
+ 		struct {
+ 			int tgid;
+diff -Naur ./original/kernel/cobalt/posix/sched.c ./modified/kernel/cobalt/posix/sched.c
+--- ./original/kernel/cobalt/posix/sched.c	2021-03-01 17:50:32.000000000 +0100
++++ ./modified/kernel/cobalt/posix/sched.c	2021-05-12 18:13:38.512521000 +0200
+@@ -462,6 +462,7 @@
+ 		group = container_of(tg, struct cobalt_sched_group, quota);
+ 		if (group->scope != cobalt_current_resources(group->pshared))
+ 			goto bad_tgid;
++		xnsched_quota_set_prio(tg, p->set.prio);
+ 		xnsched_quota_set_limit(tg, p->set.quota, p->set.quota_peak,
+ 					&quota_sum);
+ 		xnlock_put_irqrestore(&nklock, s);
+diff -Naur ./original/kernel/cobalt/sched-quota.c ./modified/kernel/cobalt/sched-quota.c
+--- ./original/kernel/cobalt/sched-quota.c	2021-05-16 13:00:58.857223500 +0200
++++ ./modified/kernel/cobalt/sched-quota.c	2021-05-17 21:56:09.385371600 +0200
+@@ -63,92 +63,18 @@
+  * Cobalt core. This only means that the SCHED_QUOTA policy won't pick
+  * them until the corresponding budget is replenished.
+  */
+-static DECLARE_BITMAP(group_map, CONFIG_XENO_OPT_SCHED_QUOTA_NR_GROUPS);
+-
+-static inline int group_is_active(struct xnsched_quota_group *tg)
+-{
+-	struct xnthread *curr = tg->sched->curr;
+-
+-	if (tg->nr_active)
+-		return 1;
+-
+-	/*
+-	 * Check whether the current thread belongs to the group, and
+-	 * is still in running state (XNREADY denotes a thread linked
+-	 * to the runqueue, in which case tg->nr_active already
+-	 * accounts for it).
+-	 */
+-	if (curr->quota == tg &&
+-	    xnthread_test_state(curr, XNREADY|XNTHREAD_BLOCK_BITS) == 0)
+-		return 1;
+ 
+-	return 0;
+-}
++static DECLARE_BITMAP(group_map, CONFIG_XENO_OPT_SCHED_QUOTA_NR_GROUPS);
+ 
+-static inline void replenish_budget(struct xnsched_quota *qs,
+-				    struct xnsched_quota_group *tg)
++//diamo una mano al caching e al compilatore ... quel codice non verrà mai usato
++static inline void replenish_budget(struct xnsched_quota_group *tg)
+ {
+-	xnticks_t budget_ns, credit_ns;
+-
+-	if (tg->quota_ns == tg->quota_peak_ns) {
+-		/*
+-		 * Fast path: we don't accumulate runtime credit.
+-		 * This includes groups with no runtime limit
+-		 * (i.e. quota off: quota >= period && quota == peak).
+-		 */
+-		tg->run_budget_ns = tg->quota_ns;
+-		return;
+-	}
+-
+-	/*
+-	 * We have to deal with runtime credit accumulation, as the
+-	 * group may consume more than its base quota during a single
+-	 * interval, up to a peak duration though (not to monopolize
+-	 * the CPU).
+-	 *
+-	 * - In the simplest case, a group is allotted a new full
+-	 * budget plus the unconsumed portion of the previous budget,
+-	 * provided the sum does not exceed the peak quota.
+-	 *
+-	 * - When there is too much budget for a single interval
+-	 * (i.e. above peak quota), we spread the extra time over
+-	 * multiple intervals through a credit accumulation mechanism.
+-	 *
+-	 * - The accumulated credit is dropped whenever a group has no
+-	 * runnable threads.
+-	 */
+-	if (!group_is_active(tg)) {
+-		/* Drop accumulated credit. */
+-		tg->run_credit_ns = 0;
+-		tg->run_budget_ns = tg->quota_ns;
+-		return;
+-	}
+-
+-	budget_ns = tg->run_budget_ns + tg->quota_ns;
+-	if (budget_ns > tg->quota_peak_ns) {
+-		/* Too much budget, spread it over intervals. */
+-		tg->run_credit_ns += budget_ns - tg->quota_peak_ns;
+-		tg->run_budget_ns = tg->quota_peak_ns;
+-	} else if (tg->run_credit_ns) {
+-		credit_ns = tg->quota_peak_ns - budget_ns;
+-		/* Consume the accumulated credit. */
+-		if (tg->run_credit_ns >= credit_ns)
+-			tg->run_credit_ns -= credit_ns;
+-		else {
+-			credit_ns = tg->run_credit_ns;
+-			tg->run_credit_ns = 0;
+-		}
+-		/* Allot extended budget, limited to peak quota. */
+-		tg->run_budget_ns = budget_ns + credit_ns;
+-	} else
+-		/* No credit, budget was below peak quota. */
+-		tg->run_budget_ns = budget_ns;
++	tg->run_budget_ns = tg->quota_ns;
+ }
+ 
+ static void quota_refill_handler(struct xntimer *timer)
+ {
+-	struct xnsched_quota_group *tg;
+-	struct xnthread *thread, *tmp;
++	struct xnsched_quota_group *tg, *tmp;
+ 	struct xnsched_quota *qs;
+ 	struct xnsched *sched;
+ 
+@@ -160,22 +86,21 @@
+ 
+ 	list_for_each_entry(tg, &qs->groups, next) {
+ 		/* Allot a new runtime budget for the group. */
+-		replenish_budget(qs, tg);
+-
+-		if (tg->run_budget_ns == 0 || list_empty(&tg->expired))
+-			continue;
+-		/*
+-		 * For each group living on this CPU, move all expired
+-		 * threads back to the runqueue. Since those threads
+-		 * were moved out of the runqueue as we were
+-		 * considering them for execution, we push them back
+-		 * in LIFO order to their respective priority group.
+-		 * The expiry queue is FIFO to keep ordering right
+-		 * among expired threads.
+-		 */
+-		list_for_each_entry_safe_reverse(thread, tmp, &tg->expired, quota_expired) {
+-			list_del_init(&thread->quota_expired);
+-			xnsched_addq(&sched->rt.runnable, thread);
++		replenish_budget(tg);
++	}
++	/*
++	* For each group living on this CPU, move all groups
++	* back to the runqueue. Since those groups
++	* were moved out of the runqueue as we were
++	* considering them for execution, we push them back
++	* in LIFO order to their respective priority group.
++	* The expiry queue is FIFO to keep ordering right
++	* among expired groups.
++	*/
++	if(!list_empty(&qs->expired)) {
++		list_for_each_entry_safe_reverse(tg, tmp, &qs->expired, quota_expired) {
++			list_del_init(&tg->quota_expired);
++			list_add_prilf(tg, &qs->runnable, cprio, rlink);
+ 		}
+ 	}
+ 
+@@ -217,6 +142,8 @@
+ 
+ 	qs->period_ns = CONFIG_XENO_OPT_SCHED_QUOTA_PERIOD * 1000ULL;
+ 	INIT_LIST_HEAD(&qs->groups);
++	INIT_LIST_HEAD(&qs->expired);
++	INIT_LIST_HEAD(&qs->runnable);
+ 
+ #ifdef CONFIG_SMP
+ 	ksformat(refiller_name, sizeof(refiller_name),
+@@ -344,52 +271,49 @@
+ 	thread->quota = NULL;
+ }
+ 
+-static void xnsched_quota_kick(struct xnthread *thread)
+-{
+-	struct xnsched_quota_group *tg = thread->quota;
+-	struct xnsched *sched = thread->sched;
+-
+-	/*
+-	 * Allow a kicked thread to be elected for running until it
+-	 * relaxes, even if the group it belongs to lacks runtime
+-	 * budget.
+-	 */
+-	if (tg->run_budget_ns == 0 && !list_empty(&thread->quota_expired)) {
+-		list_del_init(&thread->quota_expired);
+-		xnsched_addq_tail(&sched->rt.runnable, thread);
+-	}
+-}
+-
+-static inline int thread_is_runnable(struct xnthread *thread)
+-{
+-	return thread->quota->run_budget_ns > 0 ||
+-		xnthread_test_info(thread, XNKICKED);
+-}
+-
+ static void xnsched_quota_enqueue(struct xnthread *thread)
+ {
+ 	struct xnsched_quota_group *tg = thread->quota;
+ 	struct xnsched *sched = thread->sched;
+ 
+-	if (!thread_is_runnable(thread))
+-		list_add_tail(&thread->quota_expired, &tg->expired);
+-	else
+-		xnsched_addq_tail(&sched->rt.runnable, thread);
+-
++	xnsched_addq_tail(&tg->runnable, thread); 
++	/* 
++	* if the group wasn't active and now it becomes active, either it has 
++	* budget to run (likely) thus we enqueue to runnable queue, or it's 
++	* expired because of a former execution, thus	we add to expired list
++	*/
++	if ((!tg->nr_active) && (!tg->enqueued)) {
++		tg->enqueued = 1;
++		if(tg->run_budget_ns > 0) {
++			list_add_priff(tg, &sched->quota.runnable, cprio, rlink);
++		} else {
++			list_add_tail(&tg->quota_expired, &sched->quota.expired);
++		}
++	}
+ 	tg->nr_active++;
+ }
+ 
+ static void xnsched_quota_dequeue(struct xnthread *thread)
+ {
+ 	struct xnsched_quota_group *tg = thread->quota;
+-	struct xnsched *sched = thread->sched;
+ 
+-	if (!list_empty(&thread->quota_expired))
+-		list_del_init(&thread->quota_expired);
+-	else
+-		xnsched_delq(&sched->rt.runnable, thread);
++	xnsched_delq(&tg->runnable, thread);
+ 
+ 	tg->nr_active--;
++	/* 
++	* if there was a thread active in the group and now it's empty it means 
++	* that either the group was active and waiting for the CPU, thus we remove 
++	* it from the runnable queue or it's expired , thus we remove  it from 
++	* expired list. To be expired, group expire_quota must be not empty 
++	*/ 
++	if ((!tg->nr_active) && (tg->enqueued)) {
++		tg->enqueued = 0;
++		if(!list_empty(&tg->quota_expired)) {
++			list_del_init(&tg->quota_expired);
++		} else {
++			list_del(&tg->rlink);
++		}
++	}
+ }
+ 
+ static void xnsched_quota_requeue(struct xnthread *thread)
+@@ -397,14 +321,27 @@
+ 	struct xnsched_quota_group *tg = thread->quota;
+ 	struct xnsched *sched = thread->sched;
+ 
+-	if (!thread_is_runnable(thread))
+-		list_add(&thread->quota_expired, &tg->expired);
+-	else
+-		xnsched_addq(&sched->rt.runnable, thread);
++	xnsched_addq(&tg->runnable, thread);
+ 
++	if ((!tg->nr_active) && (!tg->enqueued)) {
++		tg->enqueued = 1;
++		if(tg->run_budget_ns) {
++			list_add_prilf(tg, &sched->quota.runnable, cprio, rlink);
++		} else {
++			list_add_tail(&tg->quota_expired, &sched->quota.expired);
++		}
++	}
+ 	tg->nr_active++;
+ }
+ 
++#define xnsched_first_entry_group(__q)							\
++	({									\
++		struct xnsched_quota_group *__t = NULL;					\
++		if (!list_empty(__q))						\
++			__t = list_first_entry(__q, struct xnsched_quota_group, rlink);	\
++		__t;								\
++	})
++
+ static struct xnthread *xnsched_quota_pick(struct xnsched *sched)
+ {
+ 	struct xnthread *next, *curr = sched->curr;
+@@ -426,38 +363,31 @@
+ 		otg->run_budget_ns -= elapsed;
+ 	else
+ 		otg->run_budget_ns = 0;
++
+ pick:
+-	next = xnsched_getq(&sched->rt.runnable);
+-	if (next == NULL) {
++	tg = xnsched_first_entry_group(&qs->runnable);
++
++	if (unlikely(tg == NULL)) {
+ 		xntimer_stop(&qs->limit_timer);
+ 		return NULL;
+ 	}
+ 
+-	/*
+-	 * As we basically piggyback on the SCHED_FIFO runqueue, make
+-	 * sure to detect non-quota threads.
+-	 */
+-	tg = next->quota;
+-	if (tg == NULL)
+-		return next;
+-
+-	tg->run_start_ns = now;
+-
+-	/*
+-	 * Don't consider budget if kicked, we have to allow this
+-	 * thread to run until it eventually relaxes.
+-	 */
+-	if (xnthread_test_info(next, XNKICKED)) {
+-		xntimer_stop(&qs->limit_timer);
+-		goto out;
++	if (tg-> nr_active == 0) {
++		list_del(&tg->rlink);
++		tg->enqueued = 0;
++		goto pick;
+ 	}
+ 
+ 	if (tg->run_budget_ns == 0) {
+-		/* Flush expired group members as we go. */
+-		list_add_tail(&next->quota_expired, &tg->expired);
++		/* Flush expired group as we go. */
++		list_del(&tg->rlink);
++		list_add_tail(&tg->quota_expired, &qs->expired);
+ 		goto pick;
+ 	}
+ 
++	tg->run_start_ns = now;
++	next = xnsched_getq(&tg->runnable);
++
+ 	if (otg == tg && xntimer_running_p(&qs->limit_timer))
+ 		/* Same group, leave the running timer untouched. */
+ 		goto out;
+@@ -466,9 +396,11 @@
+ 	ret = xntimer_start(&qs->limit_timer, now + tg->run_budget_ns,
+ 			    XN_INFINITE, XN_ABSOLUTE);
+ 	if (ret) {
+-		/* Budget exhausted: deactivate this group. */
++		/* Budget exhausted: deactivate this group, requeue took thread and move group. */
+ 		tg->run_budget_ns = 0;
+-		list_add_tail(&next->quota_expired, &tg->expired);
++		xnsched_addq(&tg->runnable, next);
++		list_del(&tg->rlink);
++		list_add_tail(&tg->quota_expired, &qs->expired);
+ 		goto pick;
+ 	}
+ out:
+@@ -530,8 +462,12 @@
+ 	tg->quota_peak_ns = qs->period_ns;
+ 	tg->nr_active = 0;
+ 	tg->nr_threads = 0;
++	tg->cprio = XNSCHED_QUOTA_MIN_PRIO;
++	tg->enqueued = 0;
++
+ 	INIT_LIST_HEAD(&tg->members);
+-	INIT_LIST_HEAD(&tg->expired);
++	xnsched_initq(&tg->runnable);
++	INIT_LIST_HEAD(&tg->quota_expired);
+ 
+ 	trace_cobalt_schedquota_create_group(tg);
+ 
+@@ -587,7 +523,7 @@
+ 	struct xnsched *sched = tg->sched;
+ 	struct xnsched_quota *qs = &sched->quota;
+ 	xnticks_t old_quota_ns = tg->quota_ns;
+-	struct xnthread *thread, *tmp, *curr;
++	struct xnthread *curr;
+ 	xnticks_t now, elapsed, consumed;
+ 
+ 	atomic_only();
+@@ -641,12 +577,17 @@
+ 	tg->run_credit_ns = 0;	/* Drop accumulated credit. */
+ 
+ 	*quota_sum_r = quota_sum_all(qs);
+-
+-	if (tg->run_budget_ns > 0) {
+-		list_for_each_entry_safe_reverse(thread, tmp, &tg->expired,
+-						 quota_expired) {
+-			list_del_init(&thread->quota_expired);
+-			xnsched_addq(&sched->rt.runnable, thread);
++	
++	/* we know for sure group is enqueued, either in expired list or in runtime 
++	* queue we just need to understand where is 
++	*/
++	if ((tg->run_budget_ns > 0) && (tg->enqueued)) {
++		if(!list_empty(&tg->quota_expired)) {
++			list_del_init(&tg->quota_expired);
++			list_add_priff(tg, &sched->quota.runnable, cprio, rlink);
++		} else {
++			list_del(&tg->rlink);
++			list_add_priff(tg, &sched->quota.runnable, cprio, rlink);
+ 		}
+ 	}
+ 
+@@ -654,11 +595,24 @@
+ 	 * Apply the new budget immediately, in case a member of this
+ 	 * group is currently running.
+ 	 */
++
+ 	xnsched_set_resched(sched);
+ 	xnsched_run();
+ }
+ EXPORT_SYMBOL_GPL(xnsched_quota_set_limit);
+ 
++void xnsched_quota_set_prio(struct xnsched_quota_group *tg,
++			     unsigned short int prio)
++{	
++	if(tg == NULL)
++		return;
++
++	if(prio < XNSCHED_QUOTA_MIN_PRIO_GROUP || prio > XNSCHED_QUOTA_MAX_PRIO_GROUP)
++		prio = XNSCHED_QUOTA_MIN_PRIO_GROUP;
++	tg->cprio = prio;
++}
++EXPORT_SYMBOL_GPL(xnsched_quota_set_prio);
++
+ struct xnsched_quota_group *
+ xnsched_quota_find_group(struct xnsched *sched, int tgid)
+ {
+@@ -705,6 +659,7 @@
+ 	int tgid;
+ 	xnticks_t budget;
+ 	char name[XNOBJECT_NAME_LEN];
++	int tgid_prio;
+ };
+ 
+ static struct xnvfile_snapshot_ops vfile_sched_quota_ops;
+@@ -754,7 +709,7 @@
+ 	p->tgid = thread->quota->tgid;
+ 	p->prio = thread->cprio;
+ 	p->budget = thread->quota->run_budget_ns;
+-
++	p->tgid_prio = thread->quota->cprio;
+ 	return 1;
+ }
+ 
+@@ -765,16 +720,17 @@
+ 	char buf[16];
+ 
+ 	if (p == NULL)
+-		xnvfile_printf(it, "%-3s  %-6s %-4s %-4s %-10s %s\n",
+-			       "CPU", "PID", "TGID", "PRI", "BUDGET", "NAME");
++		xnvfile_printf(it, "%-3s  %-6s %-4s %-4s %-10s %-10s %s\n",
++			       "CPU", "PID", "TGID", "PRI", "BUDGET", "GPRI", "NAME");
+ 	else {
+ 		xntimer_format_time(p->budget, buf, sizeof(buf));
+-		xnvfile_printf(it, "%3u  %-6d %-4d %-4d %-10s %s\n",
++		xnvfile_printf(it, "%3u  %-6d %-4d %-4d %-10s %-10d %s\n",
+ 			       p->cpu,
+ 			       p->pid,
+ 			       p->tgid,
+ 			       p->prio,
+ 			       buf,
++				   p->tgid_prio,
+ 			       p->name);
+ 	}
+ 
+@@ -823,7 +779,7 @@
+ 	.sched_trackprio	=	xnsched_quota_trackprio,
+ 	.sched_protectprio	=	xnsched_quota_protectprio,
+ 	.sched_forget		=	xnsched_quota_forget,
+-	.sched_kick		=	xnsched_quota_kick,
++	.sched_kick		=	NULL,
+ #ifdef CONFIG_XENO_OPT_VFILE
+ 	.sched_init_vfile	=	xnsched_quota_init_vfile,
+ 	.sched_cleanup_vfile	=	xnsched_quota_cleanup_vfile,
